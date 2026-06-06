@@ -106,3 +106,77 @@ def test_response_diagnostic_includes_safe_json_fields():
         "HTTP 409 code=DUPLICATE_HARDWARE error=hardware_already_bound "
         "message=This hardware is already registered"
     )
+
+
+def test_windows_miner_uses_attested_wallet_for_eligibility(monkeypatch):
+    module = _load_windows_miner()
+    miner = module.RustChainMiner("RTC02811ff5e2bb4bb4b95eee44c5429cd9525496e7")
+    miner.node_url = "https://node.example"
+    calls = []
+
+    class Response:
+        ok = True
+
+        def json(self):
+            return {"eligible": False, "reason": "not_your_turn", "slot": 42}
+
+    def fake_get(url, params=None, timeout=None):
+        calls.append({"url": url, "params": params, "timeout": timeout})
+        return Response()
+
+    monkeypatch.setattr(module.requests, "get", fake_get)
+
+    assert miner.check_eligibility() is False
+    assert calls == [{
+        "url": "https://node.example/lottery/eligibility",
+        "params": {"miner_id": miner.wallet_address},
+        "timeout": 10,
+    }]
+    assert miner.last_eligibility["slot"] == 42
+
+
+def test_windows_miner_generates_signed_header_for_attested_wallet(monkeypatch):
+    module = _load_windows_miner()
+    monkeypatch.setattr(module.time, "time", lambda: 1234)
+    miner = module.RustChainMiner("RTC02811ff5e2bb4bb4b95eee44c5429cd9525496e7")
+    miner.last_eligibility = {"slot": 42}
+    miner._pow_proof = {"chain": "zephyr"}
+
+    header = miner.generate_header()
+
+    assert header["miner_id"] == miner.wallet_address
+    assert header["header"]["miner"] == miner.wallet_address
+    assert header["header"]["slot"] == 42
+    assert header["header"]["pow_proof"] == {"chain": "zephyr"}
+    assert bytes.fromhex(header["message"]).decode() == (
+        f"slot:42:miner:{miner.wallet_address}:ts:1234"
+    )
+    assert header["pubkey"] == miner.wallet_address
+    assert header["signature"]
+
+
+def test_windows_miner_submits_header_to_configured_node(monkeypatch):
+    module = _load_windows_miner()
+    miner = module.RustChainMiner("RTC02811ff5e2bb4bb4b95eee44c5429cd9525496e7")
+    miner.node_url = "https://node.example"
+    calls = []
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {"ok": True}
+
+    def fake_post(url, json=None, timeout=None):
+        calls.append({"url": url, "json": json, "timeout": timeout})
+        return Response()
+
+    monkeypatch.setattr(module.requests, "post", fake_post)
+    header = {"miner_id": miner.wallet_address, "header": {}, "message": "00"}
+
+    assert miner.submit_header(header) is True
+    assert calls == [{
+        "url": "https://node.example/headers/ingest_signed",
+        "json": header,
+        "timeout": 15,
+    }]

@@ -152,6 +152,7 @@ class RustChainMiner:
         self.enrolled = False
         self.hw_info = self._get_hw_info()
         self.last_entropy = {}
+        self.last_eligibility = {}
         self.last_attestation_error = ""
         # Surfaced fingerprint status — non-empty string means the miner is
         # submitting NO fingerprint and will be enrolled at VM-tier weight
@@ -664,12 +665,16 @@ class RustChainMiner:
         """Check if eligible to mine"""
         try:
             response = requests.get(
-                f"{RUSTCHAIN_API}/lottery/eligibility?miner_id={self.miner_id}"
+                f"{self.node_url}/lottery/eligibility",
+                params={"miner_id": self.wallet_address},
+                timeout=10,
             )
             if response.ok:
-                return response.json().get("eligible", False)
+                self.last_eligibility = response.json()
+                return self.last_eligibility.get("eligible", False)
         except Exception:
             pass
+        self.last_eligibility = {}
         return False
 
     def generate_header(self):
@@ -683,9 +688,16 @@ class RustChainMiner:
         """
         timestamp = int(time.time())
         nonce     = os.urandom(4).hex()
-        header    = {
-            "miner_id":  self.miner_id,
-            "wallet":    self.wallet_address,
+        slot = (
+            self.last_eligibility.get("slot")
+            or self.last_eligibility.get("epoch")
+            or timestamp
+        )
+        chain_miner_id = self.wallet_address
+        message = f"slot:{slot}:miner:{chain_miner_id}:ts:{timestamp}"
+        header = {
+            "slot":      slot,
+            "miner":     chain_miner_id,
             "timestamp": timestamp,
             "nonce":     nonce
         }
@@ -698,15 +710,28 @@ class RustChainMiner:
         if self._pow_proof:
             header["pow_proof"] = self._pow_proof
 
-        return header
+        return {
+            "miner_id": chain_miner_id,
+            "header": header,
+            "message": message.encode().hex(),
+            "signature": hashlib.sha512(
+                f"{message}{self.wallet_address}".encode()
+            ).hexdigest(),
+            "pubkey": self.wallet_address,
+        }
 
     def submit_header(self, header):
         """Submit mining header"""
         try:
             response = requests.post(
-                f"{RUSTCHAIN_API}/headers/ingest_signed", json=header, timeout=5
+                f"{self.node_url}/headers/ingest_signed", json=header, timeout=15
             )
-            return response.status_code == 200
+            if response.status_code != 200:
+                return False
+            try:
+                return bool(response.json().get("ok", True))
+            except Exception:
+                return True
         except Exception:
             return False
 
